@@ -21,7 +21,7 @@ def checkURL(argv):
     targetData = ""
 
     try:
-        opts, args = getopt.getopt(argv, "?h:u:p:n:t:m:d:H", ["host=", "user=", "password=", "name=", "target", "method", "data", "headers"])
+        opts, args = getopt.getopt(argv, "?h:u:p:n:t:m:d:H:i", ["uri", "host=", "user=", "password=", "name=", "target", "method", "data", "headers"])
     except getopt.GetoptError:
         print('Show policy audit details.')
         print('-? checkURL.py')
@@ -29,6 +29,7 @@ def checkURL(argv):
         print('-u <username> (username=)')
         print('-p <password> (password=)')
         # print('-n <policyfilter> (name=)')
+        print('-i <uri> this will search for this URI in the existing logs (--uri')
         print('-t <targetURL> to test (--target)')
         print('-m <method> for the target to be tested (--method)')
         print('-d <escaped data> for the target to be tested (--data)')
@@ -42,6 +43,7 @@ def checkURL(argv):
             print('-h <hostname or ip> (host=)')
             print('-u <username> (username=)')
             print('-p <password> (password=)')
+            print('-i <uri> this will search for this URI in the existing logs')
             # print('-n <policyfilter> (name=)')
             print('-t <targetURL> to test')
             print('-m <method> for the target to be tested')
@@ -64,27 +66,78 @@ def checkURL(argv):
             targetData = arg
         elif opt in ("-H", "--headers"):
             targetHeaders = json.JSONEncoder.dumps(arg)
+        elif opt in ("-i", "--uri)"):
+            uri = arg
 
-    testResponse = requests.request(targetMethod, targetUrl, headers=targetHeaders, data=targetData, verify=False)
+    authToken = getAuthtoken(bigip_host, username, hiddenpassword)
+    headers = {
+        'Content-type': 'application/json',
+        'X-F5-Auth-Token': authToken
+    }
 
-    print(testResponse.text)
+    print(uri)
 
-    if (testResponse.text.find('<html><head><title>Request Rejected</title></head><body>The requested URL was rejected. Please consult with your administrator.<br><br>Your support ID is: ') > 0):
-        print('Not blocked')
+    if not uri:
+        testResponse = requests.request(targetMethod, targetUrl, headers=targetHeaders, data=targetData, verify=False)
+
+        # print(testResponse.text)
+
+        if (testResponse.text.find('<html><head><title>Request Rejected</title></head><body>The requested URL was rejected. Please consult with your administrator.<br><br>Your support ID is: ') > 0):
+            print('Not blocked')
+            sys.exit(0)
+            
+        regex = r":\s(\d+)"
+        supportId = re.findall(regex, testResponse.text)
+
+        if(supportId):
+            print(supportId[0])
+        else:
+            print('unable to locate a SupportId')          
+            sys.exit(1)
+
+        # wait for the log to be written
+        time.sleep(5)
+        checkNewURL(bigip_host, supportId, headers)
         sys.exit(0)
-        
-    regex = r":\s(\d+)"
-    supportId = re.findall(regex, testResponse.text)
 
-    if(supportId):
-        print(supportId[0])
     else:
-        print('unable to locate a SupportId')          
-        sys.exit(1)
+        # we want to find an existing Violation
+        findExistingViolation(bigip_host, uri, headers)
 
-    # wait for the log to be written
-    time.sleep(5)
+        sys.exit(0)
 
+
+
+def findExistingViolation(bigip_host, uri, headers):
+    managementUrl = "https://" + bigip_host + "/mgmt/tm/asm/events/requests/?$filter=url%20eq%20" + uri + "&$expand=violations%2FhttpSubviolationReference,violations%2FwssSubviolationReference,violations%2FevasionSubviolationReference,suggestionReferences&servertime=true"
+
+    print(managementUrl)
+        # sys.exit(2)
+    payload = {}
+
+    response = requests.request(
+            "GET", managementUrl, headers=headers, data=payload, verify=False)
+        
+        # print(response.text)
+    
+    violationData = json.loads(response.text)
+
+    pprint.pprint(violationData)
+
+def checkNewURL(bigip_host, supportId, headers):
+    managementUrl = "https://" + bigip_host + "/mgmt/tm/asm/events/requests/" + supportId[0] + "?$expand=violations%2FhttpSubviolationReference,violations%2FwssSubviolationReference,violations%2FevasionSubviolationReference,suggestionReferences&servertime=true"
+    payload = {}
+
+    response = requests.request(
+        "GET", managementUrl, headers=headers, data=payload, verify=False)
+    
+    # print(response.text)
+  
+    violationData = json.loads(response.text)
+
+    pprint.pprint(violationData)
+
+def getAuthtoken(bigip_host, username, hiddenpassword):
     managementUrl = "https://" + bigip_host + "/mgmt/shared/authn/login"
 
     payload = json.dumps({
@@ -102,46 +155,7 @@ def checkURL(argv):
     data = json.loads(response.text)
 
     authToken = data['token']['token']
-
-    managementUrl = "https://" + bigip_host + "/mgmt/tm/asm/events/requests/" + supportId[0] + "?$expand=violations%2FhttpSubviolationReference,violations%2FwssSubviolationReference,violations%2FevasionSubviolationReference,suggestionReferences&servertime=true"
-
-    payload = {}
-    headers = {
-        'Content-type': 'application/json',
-        'X-F5-Auth-Token': authToken
-    }
-
-    print(managementUrl)
-
-    response = requests.request(
-        "GET", managementUrl, headers=headers, data=payload, verify=False)
-    
-    print(response.text)
-  
-    violationData = json.loads(response.text)
-
-    pprint.pprint(violationData)
-    sys.exit(0)
-
-    for policy in policyData['items']:
-        policyID = policy['id']
-        policyName = policy['name']
-        print("\n*********\nPolicy: " + policyName)
-        managementUrl = "https://" + bigip_host + "/mgmt/tm/asm/policies/" + policyID + "/audit-logs/"
-
-        payload = ""
-
-        response = requests.request(
-            "GET", managementUrl, headers=headers, data=payload, verify=False, timeout=3600)
-
-        auditRecs = json.loads(response.text)
-        for auditItem in auditRecs['items']:
-            pcDescription = auditItem['description']
-            pcEventType = auditItem['eventType']
-            pcTimeStamp = policy['lastUpdateMicros']
-
-            print("\nPolicy change info (" + pcEventType + "): " + "\nChange Detail:" +
-                  pcDescription + "\nOn: " + str(datetime.datetime.fromtimestamp(pcTimeStamp/1000000.0)))
+    return authToken
 
 if __name__ == "__main__":
     checkURL(sys.argv[1:])
